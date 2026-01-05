@@ -75,3 +75,7 @@ Flag	Description	Default
     Permissions: You must have permissions to update the pods/ephemeralcontainers subresource in your cluster.
 
     Cluster Version: Requires Kubernetes v1.23+ (when Ephemeral Containers became stable).
+
+## 📄 License
+
+MIT License. Feel free to use and contribute!
