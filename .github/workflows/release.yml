@@ -1,45 +1,51 @@
-project_name: podump
+name: release
+on:
+  push:
+    tags:
+      - 'v*'
 
-before:
-  hooks:
-    - go mod tidy
+permissions:
+  contents: write
+  packages: write # Required to push to GHCR
 
-builds:
-  - env:
-      - CGO_ENABLED=0
-    # Ensure the binary is named correctly for kubectl plugin support
-    binary: kubectl-podump
-    goos:
-      - linux
-      - darwin
-      - windows
-    goarch:
-      - amd64
-      - arm64
+jobs:
+  goreleaser:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-archives:
-  - format: tar.gz
-    # Use format_overrides for Windows to use zip instead of tar.gz
-    format_overrides:
-      - goos: windows
-        format: zip
-    # New way to handle replacements (mapping OS/Arch names)
-    name_template: >-
-      {{ .ProjectName }}_
-      {{- .Os }}_
-      {{- if eq .Arch "amd64" }}x86_64
-      {{- else if eq .Arch "386" }}i386
-      {{- else }}{{ .Arch }}{{ end }}
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21'
 
-checksum:
-  name_template: 'checksums.txt'
+      # --- NEW: Login to GitHub Container Registry ---
+      - name: Login to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
 
-snapshot:
-  name_template: "{{ incpatch .Version }}-next"
+      # --- NEW: Build and Push Docker Image ---
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          # This tags it with 'latest' and your version tag (e.g. v1.1.0)
+          tags: |
+            ghcr.io/${{ github.repository }}:latest
+            ghcr.io/${{ github.repository }}:${{ github.ref_name }}
 
-changelog:
-  sort: asc
-  filters:
-    exclude:
-      - '^docs:'
-      - '^test:'
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@v5
+        with:
+          distribution: goreleaser
+          version: latest
+          args: release --clean
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
