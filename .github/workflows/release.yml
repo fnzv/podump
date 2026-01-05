@@ -6,23 +6,25 @@ on:
 
 permissions:
   contents: write
-  packages: write # Required to push to GHCR
+  packages: write
 
 jobs:
   goreleaser:
     runs-on: ubuntu-latest
     steps:
+      # 1. THIS IS THE MISSING PIECE: It pulls your code into the runner
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      # 2. Set up Go
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.21'
 
-      # --- NEW: Login to GitHub Container Registry ---
+      # 3. Login to GHCR
       - name: Login to GHCR
         uses: docker/login-action@v3
         with:
@@ -30,17 +32,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # --- NEW: Build and Push Docker Image ---
+      # 4. Build and Push Docker Image
       - name: Build and push Docker image
         uses: docker/build-push-action@v5
         with:
           context: .
+          file: ./Dockerfile  # Explicitly tell it where the file is
           push: true
-          # This tags it with 'latest' and your version tag (e.g. v1.1.0)
           tags: |
             ghcr.io/${{ github.repository }}:latest
             ghcr.io/${{ github.repository }}:${{ github.ref_name }}
 
+      # 5. Run GoReleaser
       - name: Run GoReleaser
         uses: goreleaser/goreleaser-action@v5
         with:
