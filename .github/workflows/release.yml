@@ -1,29 +1,45 @@
-name: release
-on:
-  push:
-    tags:
-      - 'v*' # Trigger only when you push a version tag like v1.1.0
+project_name: podump
 
-permissions:
-  contents: write
+before:
+  hooks:
+    - go mod tidy
 
-jobs:
-  goreleaser:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.21'
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@v5
-        with:
-          distribution: goreleaser
-          version: latest
-          args: release --clean
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+builds:
+  - env:
+      - CGO_ENABLED=0
+    # Ensure the binary is named correctly for kubectl plugin support
+    binary: kubectl-podump
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+
+archives:
+  - format: tar.gz
+    # Use format_overrides for Windows to use zip instead of tar.gz
+    format_overrides:
+      - goos: windows
+        format: zip
+    # New way to handle replacements (mapping OS/Arch names)
+    name_template: >-
+      {{ .ProjectName }}_
+      {{- .Os }}_
+      {{- if eq .Arch "amd64" }}x86_64
+      {{- else if eq .Arch "386" }}i386
+      {{- else }}{{ .Arch }}{{ end }}
+
+checksum:
+  name_template: 'checksums.txt'
+
+snapshot:
+  name_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  sort: asc
+  filters:
+    exclude:
+      - '^docs:'
+      - '^test:'
