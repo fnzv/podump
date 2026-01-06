@@ -38,15 +38,16 @@ krews:
     repository:
       owner: fnzv
       name: krew-index
-    homepage: https://github.com/fnzv/podump
-    short_description: Dump pod logs and specs
+    homepage: https://github.com/fnzv/kubectl-podump
+    short_description: Dump pod network traffic
     description: |
-      A command-line tool to quickly export Kubernetes pod 
-      specifications and logs to local files for debugging.
+      A command-line tool to quickly inspect network traffic.
     caveats: |
       Usage:
         kubectl podump [pod-name]
-
+      Examples:
+        kubectl podump -n monitoring prometheus port 9090
+        kubectl podump my-app --pcap > capture.pcap
 snapshot:
   version_template: "{{ incpatch .Version }}-next"
 
