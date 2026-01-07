@@ -53,6 +53,10 @@ podump -pcap my-api-pod > capture.pcap
 podump -n production auth-service
 ```
 
+5. use Debug containers attachment for applications having (hostNetwork: true)
+```
+podump -debug sensitive-app
+```
 ## 📖 How it Works
 
 Podump uses the Kubernetes EphemeralContainers API. Unlike standard sidecars, these are created at runtime.
