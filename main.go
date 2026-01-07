@@ -6,8 +6,10 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -25,7 +27,7 @@ import (
 	"k8s.io/client-go/tools/remotecommand"
 )
 
-const version = "1.4.4"
+const version = "1.6.0"
 
 type PodStats struct {
 	TotalBytes int64
@@ -36,12 +38,15 @@ type PodStats struct {
 }
 
 var (
-	statsMap   = make(map[string]*PodStats)
-	statsMutex sync.Mutex
-	startTime  time.Time
-	ansiColors = []string{"\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m", "\033[31m"}
-	portRegex  = regexp.MustCompile(`(\.(80|443|3306|5432|6379|8080|2379|9090|53)\b)`)
-	ipRegex    = regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	dnsCache      = make(map[string]string)
+	dnsMutex      sync.RWMutex
+	statsMap      = make(map[string]*PodStats)
+	statsMutex    sync.Mutex
+	startTime     time.Time
+	ansiColors    = []string{"\033[32m", "\033[33m", "\033[34m", "\033[35m", "\033[36m", "\033[31m"}
+	portRegex     = regexp.MustCompile(`(\.(80|443|3306|5432|6379|8080|2379|9090|53)\b)`)
+	ipRegex       = regexp.MustCompile(`(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})`)
+	resolverQueue = make(chan string, 100)
 )
 
 func boolPtr(b bool) *bool { return &b }
@@ -50,7 +55,7 @@ func main() {
 	nsFlag := flag.String("n", "", "Namespace (defaults to current context)")
 	pcapFlag := flag.Bool("pcap", false, "Output raw PCAP binary")
 	debugFlag := flag.Bool("debug", false, "Force Standalone Debug Pod")
-	labelFlag := flag.String("l", "", "Label selector")
+	labelFlag := flag.String("l", "", "Label selector (e.g. app=nginx)")
 	helpFlag := flag.Bool("h", false, "Show help")
 
 	flag.Usage = func() {
@@ -61,8 +66,9 @@ func main() {
 		fmt.Fprintf(os.Stderr, " | |  | (_) | (_| | |_| | | | | | |\n")
 		fmt.Fprintf(os.Stderr, " |_|   \\___/ \\__,_|_| |_| |_| |_|\n")
 		fmt.Fprintf(os.Stderr, "         v%s - Kubernetes Sniffer\n\n", version)
-		fmt.Fprintf(os.Stderr, "Usage: podump [options] [pod-name-search] [tcpdump-filters]\n")
+		fmt.Fprintf(os.Stderr, "Usage: podump [options] [pod-name-search] [tcpdump-filters]\n\nOptions:\n")
 		flag.PrintDefaults()
+		fmt.Fprintf(os.Stderr, "\nExamples:\n  podump -l app=nginx\n  podump api port 8080\n")
 		os.Exit(0)
 	}
 
@@ -86,6 +92,12 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize DNS Worker
+	go dnsResolverWorker(ctx)
+
+	// Pre-build K8s Cache
+	buildK8sCache(ctx, clientset, namespace)
+
 	var targetPods []corev1.Pod
 	listOpts := metav1.ListOptions{LabelSelector: *labelFlag}
 	allPods, _ := clientset.CoreV1().Pods(namespace).List(ctx, listOpts)
@@ -100,17 +112,21 @@ func main() {
 		os.Exit(1)
 	}
 
-	tcpdumpCmd := []string{"tcpdump", "-i", "any", "--immediate-mode", "-l", "-n"}
-	if *pcapFlag {
-		tcpdumpCmd = []string{"tcpdump", "-i", "any", "--immediate-mode", "-U", "-w", "-"}
+	pcapDir := ""
+	if *pcapFlag && len(targetPods) > 1 {
+		pcapDir = fmt.Sprintf("captures_%s", time.Now().Format("20060102_150405"))
+		os.MkdirAll(pcapDir, 0755)
 	}
+
+	tcpdumpCmd := []string{"tcpdump", "-i", "any", "--immediate-mode"}
+	if *pcapFlag { tcpdumpCmd = append(tcpdumpCmd, "-U", "-w", "-") } else { tcpdumpCmd = append(tcpdumpCmd, "-l", "-n") }
 	if len(args) > 1 { tcpdumpCmd = append(tcpdumpCmd, args[1:]...) }
 
 	var wg sync.WaitGroup
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
 
-	fmt.Fprintf(os.Stderr, "📡 Sniffing %d pod(s)...\n", len(targetPods))
+	fmt.Fprintf(os.Stderr, "📡 Sniffing %d pod(s) with Public DNS Discovery...\n", len(targetPods))
 	startTime = time.Now()
 
 	for i, pod := range targetPods {
@@ -120,8 +136,8 @@ func main() {
 			defer wg.Done()
 			var pName, cName string
 			if *debugFlag {
-				cName = "sniffer"
 				pName = createDebugPod(ctx, clientset, namespace, &p, tcpdumpCmd)
+				cName = "sniffer"
 				defer func() {
 					grace := int64(0)
 					clientset.CoreV1().Pods(namespace).Delete(context.Background(), pName, metav1.DeleteOptions{GracePeriodSeconds: &grace})
@@ -130,18 +146,57 @@ func main() {
 				pName = p.Name
 				cName = injectEphemeral(ctx, clientset, namespace, &p, tcpdumpCmd)
 			}
-			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, c, *pcapFlag)
+			streamPackets(ctx, clientset, config, namespace, pName, cName, p.Name, c, *pcapFlag, pcapDir)
 		}(pod, color)
 	}
 
 	go func() {
 		<-sigChan
-		fmt.Fprintf(os.Stderr, "\n[Stop] Stopping captures...\n")
 		cancel()
 	}()
 
 	wg.Wait()
 	printSummary()
+}
+
+func dnsResolverWorker(ctx context.Context) {
+	for {
+		select {
+		case <-ctx.Done(): return
+		case ip := <-resolverQueue:
+			dnsMutex.RLock()
+			_, exists := dnsCache[ip]
+			dnsMutex.RUnlock()
+			if exists { continue }
+
+			names, err := net.LookupAddr(ip)
+			if err == nil && len(names) > 0 {
+				dnsMutex.Lock()
+				dnsCache[ip] = names[0]
+				dnsMutex.Unlock()
+			}
+		}
+	}
+}
+
+func buildK8sCache(ctx context.Context, clientset *kubernetes.Clientset, ns string) {
+	fmt.Fprintf(os.Stderr, "🔍 Mapping K8s resources in %s...\n", ns)
+	dnsMutex.Lock()
+	defer dnsMutex.Unlock()
+
+	svcs, _ := clientset.CoreV1().Services(ns).List(ctx, metav1.ListOptions{})
+	for _, s := range svcs.Items {
+		if s.Spec.ClusterIP != "" && s.Spec.ClusterIP != "None" {
+			dnsCache[s.Spec.ClusterIP] = "svc/" + s.Name
+		}
+	}
+	pods, _ := clientset.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
+	for _, p := range pods.Items {
+		if p.Status.PodIP != "" {
+			dnsCache[p.Status.PodIP] = "pod/" + p.Name
+		}
+	}
+	dnsCache["127.0.0.1"] = "localhost"
 }
 
 func printSummary() {
@@ -159,24 +214,31 @@ func printSummary() {
 			float64(s.TCPBytes)/1024, float64(s.UDPBytes)/1024, float64(s.ICMPBytes)/1024)
 		
 		if len(s.RemoteIPs) > 0 {
-			fmt.Fprintf(os.Stderr, "   └─ TOP TALKERS (IPs):\n")
+			fmt.Fprintf(os.Stderr, "   └─ TOP TALKERS:\n")
 			type ipEntry struct { ip string; val int64 }
 			var ips []ipEntry
 			for ip, val := range s.RemoteIPs { ips = append(ips, ipEntry{ip, *val}) }
 			sort.Slice(ips, func(i, j int) bool { return ips[i].val > ips[j].val })
 
 			for count, e := range ips {
-				if count >= 3 { break }
-				fmt.Fprintf(os.Stderr, "      • %-15s %8.1f KB\n", e.ip, float64(e.val)/1024)
+				if count >= 5 { break }
+				dnsMutex.RLock()
+				name, ok := dnsCache[e.ip]
+				dnsMutex.RUnlock()
+
+				resolved := e.ip
+				if ok {
+					resolved = fmt.Sprintf("%-15s (%s)", e.ip, name)
+				}
+				fmt.Fprintf(os.Stderr, "      • %-55s %8.1f KB\n", resolved, float64(e.val)/1024)
 			}
 		}
 	}
 	fmt.Fprintf(os.Stderr, "\n------------------------------------------\n")
 }
 
-func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName, color string, isPcap bool) {
+func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config *rest.Config, ns, pod, container, originalName, color string, isPcap bool, pcapDir string) {
 	if container == "" { return }
-	
 	statsMutex.Lock()
 	statsMap[originalName] = &PodStats{RemoteIPs: make(map[string]*int64)}
 	statsMutex.Unlock()
@@ -194,21 +256,20 @@ func streamPackets(ctx context.Context, clientset *kubernetes.Clientset, config 
 			time.Sleep(1 * time.Second)
 		}
 	}
-
 ready:
 	req := clientset.CoreV1().RESTClient().Post().Resource("pods").Namespace(ns).Name(pod).SubResource("attach").
 		VersionedParams(&corev1.PodAttachOptions{Container: container, Stdout: true, Stderr: true}, scheme.ParameterCodec)
-
 	exec, _ := remotecommand.NewSPDYExecutor(config, "POST", req.URL())
-	
-	pw := &prefixWriter{
-		w:        os.Stdout,
-		prefix:   fmt.Sprintf("%s[%s]\033[0m ", color, originalName),
-		podName:  originalName,
-		isPcap:   isPcap,
-	}
 
-	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: pw, Stderr: os.Stderr})
+	var out io.Writer
+	if isPcap && pcapDir != "" {
+		f, _ := os.Create(filepath.Join(pcapDir, fmt.Sprintf("%s.pcap", originalName)))
+		defer f.Close()
+		out = f
+	} else if isPcap { out = os.Stdout
+	} else { out = &prefixWriter{w: os.Stdout, prefix: fmt.Sprintf("%s[%s]\033[0m ", color, originalName), podName: originalName, isPcap: isPcap} }
+
+	_ = exec.StreamWithContext(ctx, remotecommand.StreamOptions{Stdout: out, Stderr: os.Stderr})
 }
 
 type prefixWriter struct {
@@ -220,43 +281,39 @@ type prefixWriter struct {
 
 func (pw *prefixWriter) Write(p []byte) (n int, err error) {
 	s := statsMap[pw.podName]
-	
 	if pw.isPcap {
 		atomic.AddInt64(&s.TotalBytes, int64(len(p)))
 		return pw.w.Write(p)
 	}
-
 	lines := strings.Split(string(p), "\n")
 	for _, line := range lines {
 		if line == "" { continue }
 		lineLen := int64(len(line))
 		atomic.AddInt64(&s.TotalBytes, lineLen)
-
-		// SMART PROTOCOL DETECTION
-		// 1. TCP: Look for Flags [ ] or literal TCP
-		if strings.Contains(line, "Flags [") || strings.Contains(line, "TCP") {
-			atomic.AddInt64(&s.TCPBytes, lineLen)
-		} else if strings.Contains(line, "UDP") || strings.Contains(line, "proto 17") || strings.Contains(line, "ip-proto-17") {
-			// 2. UDP: Look for literal UDP or IP protocol 17
-			atomic.AddInt64(&s.UDPBytes, lineLen)
-		} else if strings.Contains(line, "ICMP") || strings.Contains(line, "proto 1") {
-			// 3. ICMP: Look for literal ICMP or IP protocol 1
-			atomic.AddInt64(&s.ICMPBytes, lineLen)
-		}
-
-		// IP EXTRACTION
+		if strings.Contains(line, "Flags [") || strings.Contains(line, "TCP") { atomic.AddInt64(&s.TCPBytes, lineLen)
+		} else if strings.Contains(line, "UDP") || strings.Contains(line, "proto 17") || strings.Contains(line, "ip-proto-17") { atomic.AddInt64(&s.UDPBytes, lineLen)
+		} else if strings.Contains(line, "ICMP") || strings.Contains(line, "proto 1") { atomic.AddInt64(&s.ICMPBytes, lineLen) }
+		
 		foundIPs := ipRegex.FindAllString(line, -1)
 		for _, ip := range foundIPs {
 			statsMutex.Lock()
 			if _, ok := s.RemoteIPs[ip]; !ok {
 				var v int64 = 0
 				s.RemoteIPs[ip] = &v
+				// Queue public/unknown IPs for reverse DNS resolution
+				dnsMutex.RLock()
+				_, cached := dnsCache[ip]
+				dnsMutex.RUnlock()
+				if !cached {
+					select {
+					case resolverQueue <- ip:
+					default: // Don't block if queue is full
+					}
+				}
 			}
-			// Distribute the line length among found IPs
 			atomic.AddInt64(s.RemoteIPs[ip], lineLen/int64(len(foundIPs)))
 			statsMutex.Unlock()
 		}
-
 		highlighted := portRegex.ReplaceAllString(line, "\033[1;31m$1\033[0m")
 		fmt.Fprintf(pw.w, "%s%s\n", pw.prefix, highlighted)
 	}
